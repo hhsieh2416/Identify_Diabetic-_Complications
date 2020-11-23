@@ -1,0 +1,175 @@
+---
+title: "Identifying Patients with Diabetic Complications"
+author: "Han-Yu Hsieh"
+date: "22/11/2020"
+output: 
+ html_document:
+   df_print: paged
+        
+---
+# Overview
+The purpose of this analysis is to identify patients who have diabetic complications of neuropathy, nephropathy, and/or retinopathy from clinical text notes, and it is also the course project for Clinical Natural Language Processing in Coursera. The clinical notes are synthetic from the www.MTSamples.com website and available in Google BigQuery (learnclinicaldatascience project - course4_data.diabetes_notes), which are stored by Dr. Laura K Wiley, the instructor of this course. 
+
+## 1. Loading and Reviewing Data
+```{r results='hide',message=FALSE, echo=TRUE}
+#Load packages
+library(tidyverse)
+library(magrittr)
+library(bigrquery)
+library(caret)
+myurl <- "https://raw.githubusercontent.com/hhsieh2416/Identify_Diabetic_Complications/main/data/diabetes_notes.csv"
+diabetes_notes <- read.csv(url(myurl))
+
+myurl_2 <- "https://raw.githubusercontent.com/hhsieh2416/Identify_Diabetic_Complications/main/data/glodstandrad.csv"
+goldstandard <- read.csv(url(myurl_2))
+```
+
+```{r}
+str(diabetes_notes)
+```
+There are 141 patient notes in the data, and I would like to identify patients who have diabetic complications of neuropathy, nephropathy, and/or retinopathy from the TEXT column.
+
+## 2. Exploratory Data Analysis
+Instead of using natural language processing, if I want to manually read through all the test notes, how many words will I read for each note?
+```{r echo=TRUE}
+Figure1 <- ggplot(data = diabetes_notes, aes(x=NOTE_ID, y= lengths(gregexpr("\\w+", TEXT))))+
+  geom_bar(stat = "identity", color="steelblue")+ theme_minimal()+ labs(
+    y="Numbers of Words in TEXT", title = "Words Count for Each NOTE_ID")
+Figure1
+summary(lengths(gregexpr("\\w+", diabetes_notes$TEXT)))
+```
+As we can see, the average words for each note is 639, and there are 141 notes in total. It is much beneficial to adopt natural language processing to complete the task.
+
+## 3. Feature Engineering 
+### 3.1 Applying a Window Extraction Function
+Firstly, I'd like to create text windows for all diabetic-related notes so my keyword is "diabetes" and the window size is 20 characters. 
+```{r echo=TRUE}
+extract_text_window <- function(dataframe, keyword, half_window_size) {
+  dataframe %>% 
+    group_by(NOTE_ID) %>% 
+    mutate(WORDS = TEXT) %>% 
+    separate_rows(WORDS, sep = "[ \n]+") %>% 
+    mutate(INDEX = seq(from = 1, to = n(), by = 1.0),
+           WINDOW_START = case_when(INDEX - half_window_size < 1 ~ 1, TRUE ~ INDEX - half_window_size), 
+           WINDOW_END = case_when(INDEX + half_window_size > max(INDEX) ~ max(INDEX), TRUE ~ INDEX + half_window_size), 
+           WINDOW = word(string = TEXT, start = WINDOW_START, end = WINDOW_END, sep = "[ \n]+")) %>% 
+    ungroup() %>% 
+    filter(str_detect(string = WORDS, pattern = regex(keyword, ignore_case = TRUE)))
+}
+
+diabetes_notes_window <-  diabetes_notes %>%
+  extract_text_window(keyword = "(?<![a-zA-Z])diabet(es|ic)?(?![a-zA-z])", half_window_size = 10)
+
+head(diabetes_notes_window, n=3)
+dim(diabetes_notes_window)
+```
+There are 263 text windows for all diabetic related notes.
+
+### 3.2 Remove Negation
+```{r echo=TRUE}
+diabetes_notes_1 <- diabetes_notes_window %>%
+  mutate(EXCLUDE = case_when(
+    str_detect(WINDOW, regex(pattern = "no history of (?<![a-zA-Z])diabet(es|ic)?(?![a-zA-z])", ignore_case = TRUE)) ~1,  
+    str_detect(WINDOW, regex(pattern = "den(ies|y)? any comorbid complications", ignore_case = TRUE)) ~1, 
+    str_detect(WINDOW, regex(pattern = "family history", ignore_case = TRUE)) ~1, 
+    str_detect(WINDOW, regex(pattern = "negative for (?<![a-zA-Z])diabet(es|ic)?(?![a-zA-z])", ignore_case = TRUE)) ~1, 
+    str_detect(WINDOW, regex(pattern = "(father|mother) (also)? (?<![a-zA-Z])diabet(es|ic)?(?![a-zA-z])", ignore_case = TRUE)) ~1, 
+    str_detect(WINDOW, regex(pattern = "no weakness, numbness or tingling", ignore_case = TRUE)) ~1, TRUE ~0)) %>%
+  filter(EXCLUDE !=1) 
+
+dim(diabetes_notes_1)
+```
+This step removed 36 text windows and left 227 text windows to identify diabetic complications.
+
+### 3.3 Identifying Diabetic Complications
+```{r echo=TRUE}
+diabetes_notes_COM <- diabetes_notes_1 %>%
+mutate(COMPLICATIONS = case_when(
+  str_detect(WINDOW, regex("(?<![a-zA-Z])neuropath(y|ic)?(?![a-zA-z])", ignore_case = TRUE)) ~ "neuropathy", 
+  str_detect(WINDOW, regex("diabetic nerve pain", ignore_case = TRUE)) ~ "neuropathy", 
+  str_detect(WINDOW, regex("tingling", ignore_case = TRUE)) ~ "neuropathy", 
+  str_detect(WINDOW, regex("(?<![a-zA-Z])nephropathy(?![a-zA-z])", ignore_case = TRUE)) ~"nephropathy", 
+  str_detect(WINDOW, regex("renal (insufficiency|disease)", ignore_case = TRUE)) ~"nephropathy", 
+  str_detect(WINDOW, regex("(?<![a-zA-Z])retinopath(y|ic)?(?![a-zA-z])", ignore_case = TRUE)) ~"retinopathy", TRUE~"")) %>%
+  arrange(desc(COMPLICATIONS))
+
+diabetes_notes_neuropathy <- diabetes_notes_COM %>%
+  filter(COMPLICATIONS == "neuropathy") %>%
+  select(c(NOTE_ID, WINDOW)) %>%
+  distinct(NOTE_ID, .keep_all = TRUE)
+
+diabetes_notes_nephropathy <- diabetes_notes_COM %>%
+  filter(COMPLICATIONS == "nephropathy") %>%
+  select(c(NOTE_ID, WINDOW)) %>%
+  distinct(NOTE_ID, .keep_all = TRUE)
+
+diabetes_notes_retinopathy <- diabetes_notes_COM %>%
+  filter(COMPLICATIONS == "retinopathy") %>%
+  select(c(NOTE_ID, WINDOW)) %>%
+  distinct(NOTE_ID, .keep_all = TRUE)
+```
+
+
+## 4. Reviewing the Accuracy of the Window Extraction Function
+Use the data in course4_data.diabetes_goldstandard to determine how accurate the method is. This data reviewed by HCPs.
+```{r}
+head(goldstandard , n=3)
+```
+The HCPs reviewed these 141 patients' notes manually. It is marked as 1 in "DIABETIC_NEUROPATHY", "DIABETIC_NEPHROPATHY", "DIABETIC_RETINOPATHY" columns when notes indicate that patients have these complications.
+
+### 4.1 Comparing the result 
+```{r echo=TRUE}
+goldstandard_neuropathy <- goldstandard %>%
+  select(c(NOTE_ID, DIABETIC_NEUROPATHY)) %>%
+  filter(DIABETIC_NEUROPATHY == "1") %>%
+  full_join(diabetes_notes_neuropathy, by = "NOTE_ID") 
+  
+goldstandard_nephropathy <- goldstandard %>%
+  select(c(NOTE_ID, DIABETIC_NEPHROPATHY)) %>%
+  filter(DIABETIC_NEPHROPATHY == "1") %>%
+  full_join(diabetes_notes_nephropathy, by = "NOTE_ID") 
+
+goldstandard_retinopathy <- goldstandard %>%
+  select(c(NOTE_ID, DIABETIC_RETINOPATHY)) %>%
+  filter(DIABETIC_RETINOPATHY == "1") %>%
+  full_join(diabetes_notes_retinopathy, by = "NOTE_ID")
+
+goldstandard_neuropathy
+goldstandard_nephropathy
+goldstandard_retinopathy
+```
+
+
+### 4.2 Calculating Sensitivity and Specificity of This Window Extraction Function
+```{r echo=TRUE}
+sum(is.na(goldstandard_neuropathy$DIABETIC_NEUROPATHY))+sum(is.na(goldstandard_nephropathy$DIABETIC_NEPHROPATHY))+sum(is.na(goldstandard_retinopathy$DIABETIC_RETINOPATHY))
+# 5 patients have no diabetic complications but this method identifies them having complications
+
+sum(is.na(goldstandard_neuropathy$WINDOW))+sum(is.na(goldstandard_nephropathy$WINDOW))+sum(is.na(goldstandard_retinopathy$WINDOW))
+# 6 patients have diabetic complications but this method identifies them not having complications
+
+length(which(goldstandard_neuropathy$DIABETIC_NEUROPATHY == "1" & goldstandard_neuropathy$WINDOW != "NA" ))+ 
+  length(which(goldstandard_nephropathy$DIABETIC_NEPHROPATHY == "1" & goldstandard_nephropathy$WINDOW != "NA" ))+ length(which(goldstandard_retinopathy == "1" & goldstandard_retinopathy$WINDOW != "NA" ))
+#23 patients have diabetic complications and this method identifies them correctly
+
+
+length(which(goldstandard_neuropathy$DIABETIC_NEUROPATHY == "1"))+ length(which(goldstandard_nephropathy$DIABETIC_NEPHROPATHY == "1"))+ length(which(goldstandard_retinopathy == "1"))
+#29 patients have diabetic complications. 
+#However, patient NOTE_ID 7 has both diabetic neuropathy and nephropathy.
+# 141+1-29= 113 patients have no diabetic complications.
+#113-5 = 108 patients have no diabetic complications, and this method identifies them correctly.
+
+goldST <- c("No Complications", "Complications")
+Truth <- factor(rep(goldST, times = c(113, 29)), levels = rev(goldST))
+Pred <- factor(
+  c(
+    rep(goldST, times = c(108, 5)),
+    rep(goldST, times = c(6, 23))),               
+  levels = rev(goldST))
+
+xtab <- table(Pred, Truth)
+confusionMatrix(xtab)
+```
+
+# Conlusion
+In summary, the accuracy of this clinical natural language processing method is 0.92. The sensitivity is 0.79, and the specificity is 0.95, separately. I feel satisfied with the outcome, and it definitely saves much more time compared to reading through all the text by HCPs. However, I could work on increasing sensitivity to improve the outcome, especially for diabetic retinopathy complications. 
